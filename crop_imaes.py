@@ -1,7 +1,7 @@
 import cv2
 from pathlib import Path
 
-INPUT_DIR = Path("org")
+INPUT_DIR = Path("images_org")
 OUTPUT_DIR = Path("images")  # Directory to save cropped images
 
 # Inspection image bounds in the 1920 x 1080 screenshots.

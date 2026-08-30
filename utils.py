@@ -15,6 +15,7 @@ class Candidate:
         score: float,
         mean_difference: float,
         max_difference: float,
+        frame_id: int,
     ):
         self.box: tuple = box
         self.center: tuple = center
@@ -23,6 +24,8 @@ class Candidate:
         self.mean_difference: float = mean_difference
         self.max_difference: float = max_difference
         self.confirmed: bool = False
+
+        self.frame_id = frame_id
 
 
 def _morphological_operations(
@@ -102,19 +105,16 @@ def create_adaptive_mask(
     if not 0 <= diff_threshold <= 255:
         raise ValueError("diff_threshold must be between 0 and 255.")
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 7))
-    diff = cv2.morphologyEx(gray_image, cv2.MORPH_BLACKHAT, kernel)
+    ave = cv2.GaussianBlur(gray_image, (diff_kernel[0], diff_kernel[1]), 0)
 
-    # ave = cv2.GaussianBlur(gray_image, (diff_kernel[0], diff_kernel[1]), 0)
-
-    # if diff_mode == "neg":
-    #     diff = cv2.subtract(ave, gray_image)
-    # elif diff_mode == "pos":
-    #     diff = cv2.subtract(gray_image, ave)
-    # elif diff_mode == "abs":
-    #     diff = cv2.absdiff(gray_image, ave)
-    # else:
-    #     raise ValueError(f"Invalid diff_mode: {diff_mode}")
+    if diff_mode == "neg":
+        diff = cv2.subtract(ave, gray_image)
+    elif diff_mode == "pos":
+        diff = cv2.subtract(gray_image, ave)
+    elif diff_mode == "abs":
+        diff = cv2.absdiff(gray_image, ave)
+    else:
+        raise ValueError(f"Invalid diff_mode: {diff_mode}")
 
     _, mask = cv2.threshold(
         diff,
@@ -204,34 +204,6 @@ def extract_largest_blob(roi_rotated: np.ndarray) -> np.ndarray:
     return largest_blob
 
 
-def extract_blobs_by_area(roi_rotated: np.ndarray, minimum_area: int) -> np.ndarray:
-    if roi_rotated is None:
-        raise ValueError("roi_rotated is None")
-    if minimum_area < 0:
-        raise ValueError("minimum_area must be 0 or greater")
-
-    if roi_rotated.ndim == 3:
-        roi_gray = cv2.cvtColor(roi_rotated, cv2.COLOR_BGR2GRAY)
-    else:
-        roi_gray = roi_rotated
-
-    binary = np.where(roi_gray > 0, 255, 0).astype(np.uint8)
-    label_count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        binary,
-        connectivity=8,
-    )
-
-    if label_count <= 1:
-        return np.zeros_like(binary, dtype=np.uint8)
-
-    kept_blob = np.zeros_like(binary, dtype=np.uint8)
-    for label in range(1, label_count):
-        if stats[label, cv2.CC_STAT_AREA] >= minimum_area:
-            kept_blob[labels == label] = 255
-
-    return kept_blob
-
-
 def detect_outer_contour(
     binary_image: np.ndarray,
     threshold: int = 127,
@@ -290,36 +262,139 @@ def center_distance(first: Candidate, second: Candidate):
     )
 
 
+def merge_overlapping_candidates(
+    frame_candidates: List[List[Candidate]],
+    margin: int = 5,
+    merged_score_threshold: float = 400.0,
+) -> List[List[Candidate]]:
+    """各フレームの候補をマージする。重なりのある候補は1つにまとめる"""
+
+    def boxes_overlap(first: tuple, second: tuple) -> bool:
+        first_left, first_top, first_right, first_bottom = first
+        second_left, second_top, second_right, second_bottom = second
+
+        x_overlap = max(first_left - margin, second_left - margin) < min(
+            first_right + margin, second_right + margin
+        )
+        y_overlap = max(first_top - margin, second_top - margin) < min(
+            first_bottom + margin, second_bottom + margin
+        )
+
+        return x_overlap and y_overlap
+
+    merged_frames = []
+    for candidates in frame_candidates:
+        remaining_candidates = set(range(len(candidates)))
+        merged_candidates = []
+
+        # 候補を１つずつ取り出し、重なりのある候補をまとめる
+        while remaining_candidates:
+            group_indices = {remaining_candidates.pop()}
+            pending = list(group_indices)
+
+            # 探索中リスト(pending)から１つずつ取り出し、重なりのある候補を抽出
+            # 抽出後、３つのリスト・集合を更新
+            while pending:
+                current_index = pending.pop()
+                overlapping = {
+                    candidate_index
+                    for candidate_index in remaining_candidates
+                    if boxes_overlap(
+                        candidates[current_index].box,
+                        candidates[candidate_index].box,
+                    )
+                }
+                remaining_candidates.difference_update(overlapping)
+                group_indices.update(overlapping)
+                pending.extend(overlapping)
+
+            group = [candidates[index] for index in sorted(group_indices)]
+
+            # 重なりのある候補が１つしかない場合は、スコアが閾値以上ならそのまま追加
+            if len(group) == 1:
+                if group[0].score >= merged_score_threshold:
+                    merged_candidates.append(group[0])
+                continue
+
+            # 重なりのある候補が複数ある場合は、スコア合計が閾値以上の場合に
+            # バウンディングボックスをまとめて新しい候補を作成
+            score_sum = sum(candidate.score for candidate in group)
+            if score_sum >= merged_score_threshold:
+                left = min(candidate.box[0] for candidate in group)
+                top = min(candidate.box[1] for candidate in group)
+                right = max(candidate.box[2] for candidate in group)
+                bottom = max(candidate.box[3] for candidate in group)
+
+                merged_candidates.append(
+                    Candidate(
+                        box=(left, top, right, bottom),
+                        center=((left + right) / 2.0, (top + bottom) / 2.0),
+                        area=sum(candidate.area for candidate in group),
+                        score=score_sum,
+                        mean_difference=max(
+                            candidate.mean_difference for candidate in group
+                        ),
+                        max_difference=max(
+                            candidate.max_difference for candidate in group
+                        ),
+                        frame_id=group[0].frame_id,
+                    )
+                )
+
+        merged_frames.append(merged_candidates)
+
+    return merged_frames
+
+
 def confirm_tracks(
     frame_candidates: List[List[Candidate]],
     minimum_length: int,
     maximum_gap: int,
-    maximum_distance: float,
+    maximum_distance_x: float,
+    maximum_distance_y: float,
 ):
+    """
+    各フレームで検出した欠陥候補を時系列に沿ってトラックとして結合し、
+    一定の長さ以上のトラックを欠陥として確定する
+    """
+
+    # track = {"detections": [(frame_index, candidate), ...]}
     tracks = []
     active_tracks = []
 
+    # 各フレームを順に処理し、トラックを生成
     for frame_index, candidates in enumerate(frame_candidates):
-        unmatched = set(range(len(candidates)))
+        unmatched_candidates = set(range(len(candidates)))
 
+        # 既存のアクティブトラックを処理
         for track in list(active_tracks):
-            # Check if the track is still valid
+            # 古いトラックを削除
             last_frame, last_candidate = track["detections"][-1]
             if frame_index - last_frame > maximum_gap + 1:
                 active_tracks.remove(track)
                 continue
 
-            # Find  matching candidate for the track
-            possible_matches = [
-                candidate_index
-                for candidate_index in unmatched
-                if center_distance(last_candidate, candidates[candidate_index])
-                <= maximum_distance
-            ]
+            # 距離をもとに現在のフレームの候補とのマッチングを判断
+            possible_matches = []
+            for candidate_index in unmatched_candidates:
+                candidate = candidates[candidate_index]
+                distance_x = abs(candidate.center[0] - last_candidate.center[0])
+                distance_y = abs(candidate.center[1] - last_candidate.center[1])
+
+                allowed_distance_x = maximum_distance_x
+                frame_difference = candidate.frame_id - last_candidate.frame_id
+                allowed_distance_y = maximum_distance_y * frame_difference
+
+                if (
+                    distance_x <= allowed_distance_x
+                    and distance_y <= allowed_distance_y
+                ):
+                    possible_matches.append(candidate_index)
+
             if not possible_matches:
                 continue
 
-            # Select the best match based on distance
+            # 条件を満たす候補が複数ある場合、最も距離が近い候補を選択
             match_distances = []
             for candidate_index in possible_matches:
                 candidate = candidates[candidate_index]
@@ -328,16 +403,17 @@ def confirm_tracks(
 
             _, best_index = min(match_distances)
 
-            # Update the track
+            # 既存トラックを更新
             track["detections"].append((frame_index, candidates[best_index]))
-            unmatched.remove(best_index)
+            unmatched_candidates.remove(best_index)
 
-        for candidate_index in unmatched:
+        # 新しいトラックを作成
+        for candidate_index in unmatched_candidates:
             track = {"detections": [(frame_index, candidates[candidate_index])]}
             tracks.append(track)
             active_tracks.append(track)
 
-    # Filter confirmed tracks
+    # 生成したトラックの中で、一定の長さ以上のトラックを欠陥として確定
     confirmed_tracks = [
         track for track in tracks if len(track["detections"]) >= minimum_length
     ]
@@ -351,6 +427,9 @@ def confirm_tracks(
 def annotate_image(image: np.ndarray, candidates: List[Candidate]):
     result = image.copy()
     for candidate in candidates:
+        if not candidate.confirmed:
+            continue
+
         color = (0, 0, 255) if candidate.confirmed else (0, 180, 255)
         label = "NG" if candidate.confirmed else "candidate"
         left, top, right, bottom = candidate.box
